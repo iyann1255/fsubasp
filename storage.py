@@ -7,6 +7,7 @@ from typing import Optional, Protocol
 
 from pymongo import MongoClient
 
+
 @dataclass
 class FileRecord:
     file_id: str
@@ -15,11 +16,14 @@ class FileRecord:
     kind: str
     caption: str | None = None
 
+
 @dataclass
 class UserFsubState:
     user_id: int
     offset: int
     last_rotated_ts: int  # unix seconds
+    last_gate_key: str    # file_id terakhir yang memicu gate
+
 
 class Storage(Protocol):
     # files
@@ -33,15 +37,17 @@ class Storage(Protocol):
     # fsub state
     def get_user_state(self, user_id: int) -> UserFsubState: ...
     def bump_rotate(self, user_id: int) -> UserFsubState: ...
-    def set_rotated_ts(self, user_id: int, ts: int) -> None: ...
+    def set_last_gate_key(self, user_id: int, gate_key: str) -> None: ...
 
     # stats
     def inc_skip(self, check_chat: str, n: int = 1) -> None: ...
     def top_skipped(self, limit: int = 10) -> list[tuple[str, int]]: ...
 
+
 class SQLiteStorage:
     def __init__(self, path: str = "data.db") -> None:
         self.conn = sqlite3.connect(path, check_same_thread=False)
+
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
             file_id TEXT PRIMARY KEY,
@@ -57,7 +63,6 @@ class SQLiteStorage:
             file_id TEXT NOT NULL
         )
         """)
-        # per-user rotate state
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS user_fsub_state (
             user_id INTEGER PRIMARY KEY,
@@ -65,7 +70,6 @@ class SQLiteStorage:
             last_rotated_ts INTEGER NOT NULL DEFAULT 0
         )
         """)
-        # skip stats per channel/check_chat
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS fsub_skip_stats (
             check_chat TEXT PRIMARY KEY,
@@ -73,6 +77,14 @@ class SQLiteStorage:
         )
         """)
         self.conn.commit()
+
+        # ===== AUTO MIGRATION: add last_gate_key if not exists =====
+        try:
+            self.conn.execute("ALTER TABLE user_fsub_state ADD COLUMN last_gate_key TEXT NOT NULL DEFAULT ''")
+            self.conn.commit()
+        except Exception:
+            # column already exists
+            pass
 
     def upsert(self, rec: FileRecord) -> None:
         self.conn.execute("""
@@ -109,35 +121,36 @@ class SQLiteStorage:
     # ===== state =====
     def get_user_state(self, user_id: int) -> UserFsubState:
         cur = self.conn.execute(
-            "SELECT user_id, offset, last_rotated_ts FROM user_fsub_state WHERE user_id=?",
+            "SELECT user_id, offset, last_rotated_ts, COALESCE(last_gate_key,'') FROM user_fsub_state WHERE user_id=?",
             (user_id,),
         )
         row = cur.fetchone()
         if row:
-            return UserFsubState(*row)
-        # create default
+            return UserFsubState(user_id=int(row[0]), offset=int(row[1]), last_rotated_ts=int(row[2]), last_gate_key=str(row[3] or ""))
+
         self.conn.execute(
-            "INSERT OR IGNORE INTO user_fsub_state(user_id, offset, last_rotated_ts) VALUES(?, 0, 0)",
+            "INSERT OR IGNORE INTO user_fsub_state(user_id, offset, last_rotated_ts, last_gate_key) VALUES(?, 0, 0, '')",
             (user_id,),
         )
         self.conn.commit()
-        return UserFsubState(user_id=user_id, offset=0, last_rotated_ts=0)
+        return UserFsubState(user_id=user_id, offset=0, last_rotated_ts=0, last_gate_key="")
 
     def bump_rotate(self, user_id: int) -> UserFsubState:
         st = self.get_user_state(user_id)
-        new_offset = st.offset + 1
         now = int(time.time())
+        new_offset = st.offset + 1
         self.conn.execute(
             "UPDATE user_fsub_state SET offset=?, last_rotated_ts=? WHERE user_id=?",
             (new_offset, now, user_id),
         )
         self.conn.commit()
-        return UserFsubState(user_id=user_id, offset=new_offset, last_rotated_ts=now)
+        st2 = self.get_user_state(user_id)
+        return st2
 
-    def set_rotated_ts(self, user_id: int, ts: int) -> None:
+    def set_last_gate_key(self, user_id: int, gate_key: str) -> None:
         self.conn.execute(
-            "UPDATE user_fsub_state SET last_rotated_ts=? WHERE user_id=?",
-            (ts, user_id),
+            "UPDATE user_fsub_state SET last_gate_key=? WHERE user_id=?",
+            (gate_key, user_id),
         )
         self.conn.commit()
 
@@ -156,6 +169,7 @@ class SQLiteStorage:
             (limit,),
         )
         return [(r[0], int(r[1])) for r in cur.fetchall()]
+
 
 class MongoStorage:
     def __init__(self, uri: str, db_name: str) -> None:
@@ -193,28 +207,35 @@ class MongoStorage:
     def get_user_state(self, user_id: int) -> UserFsubState:
         doc = self.user_state.find_one({"user_id": user_id}, {"_id": 0})
         if doc:
-            return UserFsubState(user_id=int(doc["user_id"]), offset=int(doc.get("offset", 0)), last_rotated_ts=int(doc.get("last_rotated_ts", 0)))
+            return UserFsubState(
+                user_id=int(doc["user_id"]),
+                offset=int(doc.get("offset", 0)),
+                last_rotated_ts=int(doc.get("last_rotated_ts", 0)),
+                last_gate_key=str(doc.get("last_gate_key", "") or ""),
+            )
+
         self.user_state.update_one(
             {"user_id": user_id},
-            {"$setOnInsert": {"user_id": user_id, "offset": 0, "last_rotated_ts": 0}},
+            {"$setOnInsert": {"user_id": user_id, "offset": 0, "last_rotated_ts": 0, "last_gate_key": ""}},
             upsert=True,
         )
-        return UserFsubState(user_id=user_id, offset=0, last_rotated_ts=0)
+        return UserFsubState(user_id=user_id, offset=0, last_rotated_ts=0, last_gate_key="")
 
     def bump_rotate(self, user_id: int) -> UserFsubState:
         now = int(time.time())
-        doc = self.user_state.find_one_and_update(
+        self.user_state.update_one(
             {"user_id": user_id},
             {"$inc": {"offset": 1}, "$set": {"last_rotated_ts": now}, "$setOnInsert": {"user_id": user_id}},
             upsert=True,
-            return_document=True,
         )
-        # Some pymongo versions return dict-like; normalize
-        st = self.user_state.find_one({"user_id": user_id}, {"_id": 0})
-        return UserFsubState(user_id=int(st["user_id"]), offset=int(st.get("offset", 0)), last_rotated_ts=int(st.get("last_rotated_ts", 0)))
+        return self.get_user_state(user_id)
 
-    def set_rotated_ts(self, user_id: int, ts: int) -> None:
-        self.user_state.update_one({"user_id": user_id}, {"$set": {"last_rotated_ts": int(ts)}}, upsert=True)
+    def set_last_gate_key(self, user_id: int, gate_key: str) -> None:
+        self.user_state.update_one(
+            {"user_id": user_id},
+            {"$set": {"last_gate_key": gate_key}},
+            upsert=True,
+        )
 
     def inc_skip(self, check_chat: str, n: int = 1) -> None:
         self.skip_stats.update_one(
@@ -226,6 +247,7 @@ class MongoStorage:
     def top_skipped(self, limit: int = 10) -> list[tuple[str, int]]:
         cur = self.skip_stats.find({}, {"_id": 0}).sort("skips", -1).limit(int(limit))
         return [(d["check_chat"], int(d.get("skips", 0))) for d in cur]
+
 
 def build_storage(backend: str, mongo_uri: str, mongo_db: str) -> Storage:
     backend = (backend or "sqlite").lower()

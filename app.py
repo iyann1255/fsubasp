@@ -121,13 +121,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
 
     # no payload: tampilkan gate kalau ada fsub (serba button)
-    if not args:
-        if CFG.force_sub_targets:
-            await _send_gate(update.message.chat_id, u.id, context, file_id=None)
-            return
-        text = CFG.start_message.format(mention=_mention_html(u))
-        await update.message.reply_html(text, disable_web_page_preview=True)
-        return
+if not args:
+    text = CFG.start_message.format(mention=_mention_html(u))
+    await update.message.reply_html(
+        text,
+        disable_web_page_preview=True
+    )
+    return
+
 
     # deep-link redeem
     code = args[0].strip()

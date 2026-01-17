@@ -1,11 +1,15 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env yang PASTI (sefolder file ini), biar gak salah kebaca
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
 
 def _getenv(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
 
 def _parse_ids(raw: str) -> set[int]:
     out: set[int] = set()
@@ -17,6 +21,7 @@ def _parse_ids(raw: str) -> set[int]:
             out.add(int(part))
     return out
 
+
 def _collect_force_sub() -> list[str]:
     targets: list[str] = []
     i = 1
@@ -27,6 +32,7 @@ def _collect_force_sub() -> list[str]:
         targets.append(v)
         i += 1
     return targets
+
 
 def _parse_chat_ids_csv(raw: str) -> list[int]:
     out: list[int] = []
@@ -40,17 +46,32 @@ def _parse_chat_ids_csv(raw: str) -> list[int]:
             out.append(int(p))
     return out
 
+
+def _parse_csv_list(raw: str) -> list[str]:
+    # buat titles: "A,B,C" -> ["A","B","C"]
+    items: list[str] = []
+    for part in (raw or "").split(","):
+        p = part.strip()
+        if p:
+            items.append(p)
+    return items
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
     owner_id: int
     admins: set[int]
 
-    # DB targets (bisa 1 atau banyak)
+    # DB targets (bisa 1 atau banyak) - penyimpanan file asli
     db_targets: list[int]
 
     # FSUB targets
     force_sub_targets: list[str]
+
+    # POST targets (tujuan upload pilihan via button)
+    post_channel_ids: list[int]
+    post_channel_titles: list[str]
 
     # UI
     buttons_per_row: int
@@ -72,6 +93,7 @@ class Config:
     mongo_uri: str
     mongo_db: str
 
+
 def load_config() -> Config:
     bot_token = _getenv("BOT_TOKEN")
     if not bot_token:
@@ -84,7 +106,9 @@ def load_config() -> Config:
     admins = _parse_ids(_getenv("ADMINS"))
     admins.add(owner_id)
 
-    # multi DB
+    # =====================
+    # MULTI DB TARGETS
+    # =====================
     db_targets = _parse_chat_ids_csv(_getenv("DB_TARGETS"))
 
     # backward compat: CHANNEL_ID lama
@@ -98,20 +122,41 @@ def load_config() -> Config:
     if not db_targets:
         raise SystemExit("ENV DB_TARGETS wajib diisi (atau CHANNEL_ID untuk mode lama)")
 
+    # =====================
+    # FSUB TARGETS
+    # =====================
     targets = _collect_force_sub()
 
+    # =====================
+    # POST CHANNEL (SELECT VIA BUTTON)
+    # =====================
+    post_channel_ids = _parse_chat_ids_csv(_getenv("POST_CHANNEL_IDS"))
+    post_channel_titles = _parse_csv_list(_getenv("POST_CHANNEL_TITLES"))
+
+    # =====================
+    # UI
+    # =====================
     buttons_per_row = int(_getenv("BUTTONS_PER_ROW", "2") or "2")
     join_text = _getenv("BUTTONS_JOIN_TEXT", "ᴊᴏɪɴ") or "ᴊᴏɪɴ"
     max_join_buttons = int(_getenv("MAX_JOIN_BUTTONS", "4") or "4")
     rotate_seconds = int(_getenv("ROTATE_SECONDS", "30") or "30")
 
+    # =====================
+    # MESSAGES
+    # =====================
     start_message = _getenv("START_MESSAGE", "<b>Hai {mention}</b>")
-    force_sub_message = _getenv("FORCE_SUB_MESSAGE", "<b>Wajib join dulu</b>")
+    force_sub_message = _getenv("FORCE_SUB_MESSAGE", "<b>Akses File</b>")
 
+    # =====================
+    # SECURITY
+    # =====================
     secret_key = _getenv("SECRET_KEY")
     if not secret_key or len(secret_key) < 16:
         raise SystemExit("ENV SECRET_KEY wajib diisi (min 16 char)")
 
+    # =====================
+    # STORAGE
+    # =====================
     storage_backend = (_getenv("STORAGE_BACKEND", "sqlite") or "sqlite").lower()
     mongo_uri = _getenv("MONGO_URI")
     mongo_db = _getenv("MONGO_DB", "fsub")
@@ -122,6 +167,8 @@ def load_config() -> Config:
         admins=admins,
         db_targets=db_targets,
         force_sub_targets=targets,
+        post_channel_ids=post_channel_ids,
+        post_channel_titles=post_channel_titles,
         buttons_per_row=max(1, min(buttons_per_row, 8)),
         join_text=join_text,
         max_join_buttons=max(1, min(max_join_buttons, 12)),

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 from uuid import uuid4
+from typing import List, Dict, Any, Tuple
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -31,31 +33,104 @@ STORE = build_storage(CFG.storage_backend, CFG.mongo_uri, CFG.mongo_db)
 
 CB_DONE = "fsub_done"
 
+# ===== POST MULTI SELECT ENV =====
+def _parse_chat_ids_csv(raw: str) -> List[int]:
+    out: List[int] = []
+    for part in (raw or "").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if p.startswith("-") and p[1:].isdigit():
+            out.append(int(p))
+        elif p.isdigit():
+            out.append(int(p))
+    return out
+
+POST_CHANNEL_IDS = _parse_chat_ids_csv(os.getenv("POST_CHANNEL_IDS", "").strip())
+POST_CHANNEL_TITLES = [x.strip() for x in os.getenv("POST_CHANNEL_TITLES", "").split(",") if x.strip()]
+
+# Callback prefixes
+CB_POST_TOGGLE = "post_tgl"
+CB_POST_SEND = "post_send"
+CB_POST_CANCEL = "post_cancel"
+
+# user_data keys
+UD_POST_SESS = "post_sessions"  # dict[token] = {"chat_id":int, "msg_id":int, "sel":set[int]}
+
 
 def _mention_html(user) -> str:
     name = (user.first_name or "bro").replace("<", "").replace(">", "")
     return f"<a href='tg://user?id={user.id}'>{name}</a>"
 
 
-def _is_admin(user_id: int) -> bool:
-    return user_id in CFG.admins
-
-
 def _pick_db_target() -> int:
     return random.choice(CFG.db_targets)
 
 
+def _get_post_titles() -> List[str]:
+    titles: List[str] = []
+    for i in range(len(POST_CHANNEL_IDS)):
+        if i < len(POST_CHANNEL_TITLES):
+            titles.append(POST_CHANNEL_TITLES[i])
+        else:
+            titles.append(f"CH{i+1}")
+    return titles
+
+
+def _get_sessions(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
+    m = context.user_data.get(UD_POST_SESS)
+    if not isinstance(m, dict):
+        m = {}
+        context.user_data[UD_POST_SESS] = m
+    return m
+
+
+def _build_post_keyboard(token: str, selected: set[int]) -> InlineKeyboardMarkup:
+    titles = _get_post_titles()
+    rows: List[List[InlineKeyboardButton]] = []
+
+    # tampil 1 tombol per row biar rapih (bisa kamu ubah jadi 2 per row kalau mau)
+    for i, title in enumerate(titles):
+        mark = "✅" if i in selected else "☑️"
+        rows.append([InlineKeyboardButton(f"{mark} {title}", callback_data=f"{CB_POST_TOGGLE}:{token}:{i}")])
+
+    rows.append([
+        InlineKeyboardButton("🚀 Kirim", callback_data=f"{CB_POST_SEND}:{token}"),
+        InlineKeyboardButton("✖️ Batal", callback_data=f"{CB_POST_CANCEL}:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _post_to_targets(
+    context: ContextTypes.DEFAULT_TYPE,
+    from_chat_id: int,
+    from_message_id: int,
+    target_chat_ids: List[int],
+) -> Tuple[int, List[int]]:
+    ok = 0
+    failed: List[int] = []
+    for ch in target_chat_ids:
+        try:
+            await context.bot.copy_message(
+                chat_id=ch,
+                from_chat_id=from_chat_id,
+                message_id=from_message_id,
+            )
+            ok += 1
+        except Exception:
+            failed.append(ch)
+    return ok, failed
+
+
+# ===== FSUB gate helpers =====
 async def _send_gate(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, file_id: str | None) -> None:
     """
-    AUTO-ROTATE per file:
-    - gate_key = file_id (atau "__none__")
-    - kalau gate_key beda dari last_gate_key user → offset++ otomatis
+    Gate FSUB hanya untuk akses file (redeem).
+    AUTO-ROTATE per file + tracking skip tetap aktif.
     """
     gate_key = file_id or "__none__"
     st = STORE.get_user_state(user_id)
 
-    # tracking: kalau user pindah ke gate file lain padahal belum join,
-    # anggap dia "melewatin" batch yang sebelumnya ditawarin (skips++)
     if st.last_gate_key and st.last_gate_key != gate_key:
         prev_visible = visible_targets_for_user(
             CFG.force_sub_targets,
@@ -69,7 +144,6 @@ async def _send_gate(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_T
 
         st = STORE.bump_rotate(user_id)
 
-    # set gate key terbaru
     if st.last_gate_key != gate_key:
         STORE.set_last_gate_key(user_id, gate_key)
         st = STORE.get_user_state(user_id)
@@ -113,24 +187,23 @@ async def _send_file(chat_id: int, context: ContextTypes.DEFAULT_TYPE, file_id: 
         await context.bot.send_message(chat_id=chat_id, text="Gagal ambil file dari DB. Cek akses bot di DB target.")
 
 
+# ===== Commands / Callbacks =====
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /start tanpa payload: welcome saja (tidak gate).
+    /start <CODE>: redeem file -> kalau belum join, baru gate.
+    """
     if not update.message or not update.effective_user:
         return
 
     u = update.effective_user
     args = context.args
 
-    # no payload: tampilkan gate kalau ada fsub (serba button)
-if not args:
-    text = CFG.start_message.format(mention=_mention_html(u))
-    await update.message.reply_html(
-        text,
-        disable_web_page_preview=True
-    )
-    return
+    if not args:
+        text = CFG.start_message.format(mention=_mention_html(u))
+        await update.message.reply_html(text, disable_web_page_preview=True)
+        return
 
-
-    # deep-link redeem
     code = args[0].strip()
     file_id = STORE.get_file_id_by_code(code)
     if not file_id:
@@ -165,23 +238,121 @@ async def done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await q.answer()
-
-    # clean gate message
     try:
         await q.message.delete()
     except Exception:
         pass
 
-    # reset gate key biar next file bisa rotate normal
     STORE.set_last_gate_key(q.from_user.id, "")
 
     if file_id:
         await _send_file(q.message.chat_id, context, file_id)
     else:
-        await context.bot.send_message(chat_id=q.message.chat_id, text="✅ Oke, akses kebuka. Sekarang kirim file aja.")
+        await context.bot.send_message(chat_id=q.message.chat_id, text="✅ Oke, akses kebuka.")
 
 
+# ===== POST SELECT CALLBACKS =====
+async def cb_post_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+
+    data = (q.data or "")
+    # post_tgl:token:index
+    try:
+        _, token, idx_str = data.split(":", 2)
+        idx = int(idx_str)
+    except Exception:
+        await q.answer()
+        return
+
+    sess = _get_sessions(context).get(token)
+    if not sess:
+        await q.answer("Session expired.", show_alert=True)
+        return
+
+    selected: set[int] = sess["sel"]
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.add(idx)
+
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(reply_markup=_build_post_keyboard(token, selected))
+    except Exception:
+        pass
+
+
+async def cb_post_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+
+    data = (q.data or "")
+    # post_send:token
+    try:
+        _, token = data.split(":", 1)
+    except Exception:
+        await q.answer()
+        return
+
+    sessions = _get_sessions(context)
+    sess = sessions.get(token)
+    if not sess:
+        await q.answer("Session expired.", show_alert=True)
+        return
+
+    selected: set[int] = sess["sel"]
+    if not selected:
+        await q.answer("Pilih minimal 1 channel.", show_alert=True)
+        return
+
+    targets = [POST_CHANNEL_IDS[i] for i in sorted(selected) if 0 <= i < len(POST_CHANNEL_IDS)]
+    ok_count, failed = await _post_to_targets(context, sess["chat_id"], sess["msg_id"], targets)
+
+    await q.answer()
+
+    # edit message jadi hasil
+    if failed:
+        await q.edit_message_text(f"✅ Terkirim: {ok_count}\n❌ Gagal: {len(failed)} (cek izin bot di target)")
+    else:
+        await q.edit_message_text(f"✅ Terkirim ke {ok_count} channel.")
+
+    sessions.pop(token, None)
+
+
+async def cb_post_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+
+    data = (q.data or "")
+    # post_cancel:token
+    try:
+        _, token = data.split(":", 1)
+    except Exception:
+        await q.answer()
+        return
+
+    sessions = _get_sessions(context)
+    sessions.pop(token, None)
+
+    await q.answer()
+    try:
+        await q.edit_message_text("Dibatalkan.")
+    except Exception:
+        pass
+
+
+# ===== UPLOAD HANDLER =====
 async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Upload otomatis:
+    - Simpan ke DB (selalu)
+    - Balas link /start=CODE
+    - Kalau POST_CHANNEL_IDS ada -> kirim tombol select untuk post ke channel tertentu
+    """
     msg = update.effective_message
     u = update.effective_user
     if not msg or not u:
@@ -201,14 +372,7 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         return
 
-    # serba button: kalau belum join, tampilkan gate (tanpa command lain)
-    if (not _is_admin(u.id)) and CFG.force_sub_targets:
-        ok = await is_user_joined_all(context, u.id, CFG.force_sub_targets)
-        if not ok:
-            await _send_gate(msg.chat_id, u.id, context, file_id=None)
-            return
-
-    # copy ke DB
+    # 1) Save to DB target
     db_chat_id = _pick_db_target()
     try:
         copied = await context.bot.copy_message(
@@ -232,6 +396,7 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     )
 
+    # 2) Create link
     me = await context.bot.get_me()
     if not me.username:
         await msg.reply_text("Bot belum punya username. Set dulu di @BotFather.")
@@ -243,23 +408,47 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not STORE.get_file_id_by_code(c):
             code = c
             break
-
     if not code:
         await msg.reply_text("Gagal generate code unik. Coba ulang.")
         return
 
     STORE.save_link(code, file_id)
-
     link = f"https://t.me/{me.username}?start={code}"
+
+    # Balas link (ini tetap)
     await msg.reply_html(f"<b>Saved.</b>\n<code>{link}</code>", disable_web_page_preview=True)
+
+    # 3) Post select buttons (kalau diset)
+    if POST_CHANNEL_IDS:
+        token = gen_code(12)
+
+        sessions = _get_sessions(context)
+        sessions[token] = {
+            "chat_id": msg.chat_id,
+            "msg_id": msg.message_id,   # ini message media asli user, yang akan di-copy
+            "sel": set(),              # awalnya kosong (user pilih sendiri)
+        }
+
+        # kirim menu button
+        await msg.reply_text(
+            "Pilih channel tujuan upload:",
+            reply_markup=_build_post_keyboard(token, sessions[token]["sel"]),
+        )
 
 
 def main() -> None:
     app: Application = ApplicationBuilder().token(CFG.bot_token).build()
 
+    # core
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(done_cb, pattern=r"^fsub_done:"))
 
+    # post select
+    app.add_handler(CallbackQueryHandler(cb_post_toggle, pattern=r"^post_tgl:"))
+    app.add_handler(CallbackQueryHandler(cb_post_send, pattern=r"^post_send:"))
+    app.add_handler(CallbackQueryHandler(cb_post_cancel, pattern=r"^post_cancel:"))
+
+    # uploads
     app.add_handler(
         MessageHandler(
             (filters.Document.ALL | filters.VIDEO | filters.PHOTO | filters.AUDIO | filters.VOICE),

@@ -21,6 +21,7 @@ FORCE_SUB3=-1003617219639
 BUTTONS_PER_ROW=2
 BUTTONS_JOIN_TEXT=ᴊᴏɪɴ
 MAX_JOIN_BUTTONS=4
+ROTATE_SECONDS=30
 
 # Messages (HTML parse)
 START_MESSAGE=<b>Hai {mention}</b>\nKirim file ke aku, nanti aku kasih link aman.\n\n<i>Note:</i> Kamu wajib join semua channel di bawah dulu ya.
